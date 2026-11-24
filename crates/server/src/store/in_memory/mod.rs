@@ -603,21 +603,12 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
 
         let closest_proof = inner.closest_nsec(name);
 
-        // we need the wildcard proof, but make sure that it's still part of the zone.
-        let wildcard = name.base_name();
-        let origin = self.origin();
-        let wildcard = if origin.zone_of(&wildcard) {
-            wildcard
-        } else {
-            origin.clone()
-        };
-
-        // don't duplicate the record...
-        let wildcard_proof = if wildcard != *name {
-            inner.closest_nsec(&wildcard)
-        } else {
-            None
-        };
+        // add the NSEC record that covers or matches the relevant wildcard name, as applicable
+        let wildcard_proof = inner
+            .source_of_synthesis(name)
+            // out of the zone for a query at or above the apex
+            .filter(|source| self.origin().zone_of(source))
+            .and_then(|source| inner.closest_nsec(&source));
 
         let proofs = match (closest_proof, wildcard_proof) {
             (Some(closest_proof), Some(wildcard_proof)) => {

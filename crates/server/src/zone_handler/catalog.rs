@@ -910,7 +910,8 @@ async fn build_authoritative_response(
                     Some(NxProofKind::Nsec) if has_wildcard_match => handler
                         .nsec_records(query.name(), lookup_options)
                         .await
-                        .map_result(),
+                        .map_result()
+                        .map(|result| result.map(|nsecs| covering_nsecs(nsecs, query.name()))),
                     _ => None,
                 };
 
@@ -1273,6 +1274,38 @@ fn summarize_proofs<'a>(
     dnssec_summary
 }
 
+/// Keep the NSEC records covering `name`, the whole proof for a wildcard answer (RFC 4035 section
+/// 3.1.3.3).
+#[cfg(feature = "__dnssec")]
+fn covering_nsecs(nsecs: AuthLookup, name: &LowerName) -> AuthLookup {
+    match nsecs {
+        AuthLookup::Records {
+            answers: LookupRecords::ManyRecords(lookup_options, mut rr_sets),
+            additionals,
+        } => {
+            rr_sets.retain(|rr_set| {
+                let owner = LowerName::from(rr_set.name());
+                rr_set
+                    .records_without_rrsigs()
+                    .any(|record| match &record.data {
+                        RData::DNSSEC(DNSSECRData::NSEC(nsec)) => {
+                            let next = LowerName::from(nsec.next_domain_name());
+                            // the last NSEC wraps around to the apex
+                            owner < *name && (*name < next || next <= owner)
+                        }
+                        _ => false,
+                    })
+            });
+
+            AuthLookup::Records {
+                answers: LookupRecords::ManyRecords(lookup_options, rr_sets),
+                additionals,
+            }
+        }
+        nsecs => nsecs,
+    }
+}
+
 /// Combine a [`DnssecSummary`] with a [`Proof`].
 #[cfg(feature = "__dnssec")]
 fn update_dnssec_summary_with_proof(summary: DnssecSummary, proof: Proof) -> DnssecSummary {
@@ -1417,5 +1450,39 @@ mod tests {
         assert!(message.answers.is_empty());
         assert!(!message.authorities.is_empty());
         assert_eq!(message.authorities[0].record_type(), RecordType::NS);
+    }
+}
+
+#[cfg(all(test, feature = "__dnssec"))]
+mod covering_nsecs_tests {
+    use std::str::FromStr;
+
+    use super::*;
+    use crate::proto::{
+        dnssec::rdata::NSEC,
+        rr::{Name, RecordSet},
+    };
+
+    #[test]
+    fn covering_nsecs_keeps_the_last_nsec_for_a_name_after_it() {
+        let nsecs = [("*.example.", "a.example."), ("a.example.", "example.")]
+            .into_iter()
+            .map(|(owner, next)| {
+                let nsec = NSEC::new(Name::from_str(next).unwrap(), [RecordType::A]);
+                let owner = Name::from_str(owner).unwrap();
+                let record =
+                    Record::from_rdata(owner, 3600, RData::DNSSEC(DNSSECRData::NSEC(nsec)));
+                Arc::new(RecordSet::from(record))
+            })
+            .collect();
+        let nsecs = AuthLookup::answers(LookupRecords::many(LookupOptions::default(), nsecs), None);
+
+        let name = LowerName::from(Name::from_str("z.example.").unwrap());
+        let kept = covering_nsecs(nsecs, &name)
+            .iter()
+            .map(|record| record.name.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kept, [Name::from_str("a.example.").unwrap()]);
     }
 }
